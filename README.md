@@ -1,1 +1,0 @@
-# ayhamalkebsi_bot-
