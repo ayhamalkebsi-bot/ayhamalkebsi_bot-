@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -11,13 +12,13 @@ from aiogram import Bot
 
 from config import Settings
 from database import Database
-from shopdigital import ShopDigitalClient, ShopDigitalError
 from handlers.common import safe_text
+from shopdigital import ShopDigitalClient, ShopDigitalError
 
 
 logger = logging.getLogger(__name__)
 
-# Binance-Peg BSC-USD / USDT على شبكة BSC.
+# عقد USDT على شبكة BNB Smart Chain.
 USDT_CONTRACT = (
     "0x55d398326f99059ff775485246999027b3197955"
 )
@@ -29,29 +30,71 @@ TRANSFER_TOPIC = (
 )
 
 USDT_DECIMALS = 18
-REQUIRED_CONFIRMATIONS = 12
-POLL_INTERVAL_SECONDS = 10
 
-# عند إعادة تشغيل البوت، يعيد فحص عدد من البلوكات السابقة.
-INITIAL_LOOKBACK_BLOCKS = 5000
-BLOCKS_PER_REQUEST = 500
+# عدد التأكيدات قبل اعتماد التحويل.
+REQUIRED_CONFIRMATIONS = 12
+
+# مدة الانتظار بين كل فحص.
+POLL_INTERVAL_SECONDS = 15
+
+# يغطي الدفعات السابقة بعد إعادة تشغيل البوت.
+# شبكة BSC تنتج بلوكًا كل عدة ثوانٍ تقريبًا،
+# لذلك 1000 بلوك يغطي أكثر من مهلة الدفع غالبًا.
+INITIAL_LOOKBACK_BLOCKS = 1000
+
+# نطاق صغير لتقليل احتمالية رفض eth_getLogs.
+BLOCKS_PER_REQUEST = 25
+
+# عدد محاولات طلبات RPC المؤقتة.
+RPC_MAX_RETRIES = 3
 
 
 class RpcError(RuntimeError):
-    pass
+    """خطأ صادر من JSON-RPC."""
+
+
+class RpcHttpError(RpcError):
+    """خطأ HTTP صادر من مزود RPC."""
+
+    def __init__(
+        self,
+        *,
+        status: int,
+        method: str,
+        message: str,
+    ) -> None:
+        self.status = status
+        self.method = method
+        self.message = message
+
+        super().__init__(
+            f"{method} HTTP {status}: {message}"
+        )
 
 
 def address_topic(address: str) -> str:
-    """تحويل عنوان Ethereum/BSC إلى topic بطول 32 بايت."""
-    clean_address = address.lower().removeprefix("0x")
+    """تحويل عنوان BSC إلى topic بطول 32 بايت."""
+    clean_address = address.strip().lower()
+
+    if clean_address.startswith("0x"):
+        clean_address = clean_address[2:]
+
+    if len(clean_address) != 40:
+        raise ValueError(
+            f"عنوان المحفظة غير صالح: {address}"
+        )
+
     return "0x" + clean_address.rjust(64, "0")
 
 
 def parse_sqlite_datetime(value: str) -> datetime:
+    """تحويل وقت SQLite إلى UTC."""
     parsed = datetime.fromisoformat(value)
 
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(
+            tzinfo=timezone.utc
+        )
 
     return parsed.astimezone(timezone.utc)
 
@@ -62,6 +105,7 @@ async def rpc_call(
     method: str,
     params: list[Any],
 ) -> Any:
+    """تنفيذ طلب JSON-RPC مع إعادة المحاولة للأخطاء المؤقتة."""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -69,24 +113,120 @@ async def rpc_call(
         "params": params,
     }
 
-    async with session.post(
-        rpc_url,
-        json=payload,
-    ) as response:
-        response.raise_for_status()
-        data = await response.json()
+    last_error: Exception | None = None
 
-    if data.get("error"):
-        raise RpcError(
-            f"{method}: {data['error']}"
-        )
+    for attempt in range(1, RPC_MAX_RETRIES + 1):
+        try:
+            async with session.post(
+                rpc_url,
+                json=payload,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+            ) as response:
+                response_text = await response.text()
 
-    if "result" not in data:
-        raise RpcError(
-            f"رد غير صالح من RPC عند تنفيذ {method}"
-        )
+                if response.status != 200:
+                    error = RpcHttpError(
+                        status=response.status,
+                        method=method,
+                        message=response_text[:500],
+                    )
 
-    return data["result"]
+                    # 403 يُعالَج لاحقًا بتقسيم نطاق البلوكات.
+                    if response.status == 403:
+                        raise error
+
+                    # إعادة المحاولة للأخطاء المؤقتة.
+                    if (
+                        response.status == 429
+                        or response.status >= 500
+                    ):
+                        last_error = error
+
+                        retry_after = (
+                            response.headers.get(
+                                "Retry-After"
+                            )
+                        )
+
+                        if retry_after:
+                            try:
+                                delay = float(
+                                    retry_after
+                                )
+                            except ValueError:
+                                delay = attempt * 2
+                        else:
+                            delay = attempt * 2
+
+                        logger.warning(
+                            "RPC temporary HTTP error: "
+                            "method=%s status=%s "
+                            "attempt=%s/%s retry_in=%ss",
+                            method,
+                            response.status,
+                            attempt,
+                            RPC_MAX_RETRIES,
+                            delay,
+                        )
+
+                        await asyncio.sleep(delay)
+                        continue
+
+                    raise error
+
+                try:
+                    data = json.loads(response_text)
+                except json.JSONDecodeError as exc:
+                    raise RpcError(
+                        f"{method}: رد JSON غير صالح: "
+                        f"{response_text[:300]}"
+                    ) from exc
+
+                if data.get("error"):
+                    raise RpcError(
+                        f"{method}: {data['error']}"
+                    )
+
+                if "result" not in data:
+                    raise RpcError(
+                        "رد غير صالح من RPC عند تنفيذ "
+                        f"{method}: {data}"
+                    )
+
+                return data["result"]
+
+        except (
+            aiohttp.ClientConnectionError,
+            aiohttp.ServerTimeoutError,
+            asyncio.TimeoutError,
+        ) as exc:
+            last_error = exc
+
+            if attempt >= RPC_MAX_RETRIES:
+                break
+
+            delay = attempt * 2
+
+            logger.warning(
+                "RPC connection error: "
+                "method=%s attempt=%s/%s "
+                "retry_in=%ss error=%s",
+                method,
+                attempt,
+                RPC_MAX_RETRIES,
+                delay,
+                exc,
+            )
+
+            await asyncio.sleep(delay)
+
+    raise RpcError(
+        f"فشل الاتصال بـ RPC عند تنفيذ {method}: "
+        f"{last_error}"
+    )
 
 
 async def get_latest_block(
@@ -99,6 +239,7 @@ async def get_latest_block(
         "eth_blockNumber",
         [],
     )
+
     return int(result, 16)
 
 
@@ -109,28 +250,84 @@ async def get_transfer_logs(
     from_block: int,
     to_block: int,
 ) -> list[dict[str, Any]]:
+    """
+    قراءة تحويلات USDT إلى المحفظة.
+
+    إذا رفض Chainstack نطاق البلوكات بـ403،
+    يُقسَّم النطاق تلقائيًا إلى أجزاء أصغر.
+    """
     if from_block > to_block:
         return []
 
-    result = await rpc_call(
-        session,
-        rpc_url,
-        "eth_getLogs",
-        [
-            {
-                "fromBlock": hex(from_block),
-                "toBlock": hex(to_block),
-                "address": USDT_CONTRACT,
-                "topics": [
-                    TRANSFER_TOPIC,
-                    None,
-                    address_topic(wallet_address),
-                ],
-            }
-        ],
-    )
+    params = [
+        {
+            "fromBlock": hex(from_block),
+            "toBlock": hex(to_block),
+            "address": USDT_CONTRACT,
+            "topics": [
+                TRANSFER_TOPIC,
+                None,
+                address_topic(wallet_address),
+            ],
+        }
+    ]
 
-    return list(result)
+    try:
+        result = await rpc_call(
+            session,
+            rpc_url,
+            "eth_getLogs",
+            params,
+        )
+
+        return list(result)
+
+    except RpcHttpError as exc:
+        block_count = (
+            to_block - from_block + 1
+        )
+
+        # بعض مزودي RPC يرفضون نطاقًا كبيرًا.
+        # نقسم النطاق إلى نصفين تلقائيًا.
+        if exc.status in {403, 413} and block_count > 1:
+            middle_block = (
+                from_block + to_block
+            ) // 2
+
+            logger.warning(
+                "eth_getLogs rejected for blocks "
+                "%s-%s with HTTP %s; "
+                "splitting request",
+                from_block,
+                to_block,
+                exc.status,
+            )
+
+            first_half = await get_transfer_logs(
+                session,
+                rpc_url,
+                wallet_address,
+                from_block,
+                middle_block,
+            )
+
+            second_half = await get_transfer_logs(
+                session,
+                rpc_url,
+                wallet_address,
+                middle_block + 1,
+                to_block,
+            )
+
+            return first_half + second_half
+
+        # إذا كان حتى البلوك الواحد مرفوضًا،
+        # فالمشكلة من صلاحية العقدة أو إعداداتها.
+        raise RpcError(
+            "Chainstack رفض eth_getLogs حتى بعد "
+            "تقليل نطاق البلوكات. "
+            f"HTTP {exc.status}: {exc.message}"
+        ) from exc
 
 
 async def get_block_timestamp(
@@ -150,7 +347,10 @@ async def get_block_timestamp(
             f"تعذر قراءة البلوك رقم {block_number}"
         )
 
-    timestamp = int(block["timestamp"], 16)
+    timestamp = int(
+        block["timestamp"],
+        16,
+    )
 
     return datetime.fromtimestamp(
         timestamp,
@@ -180,6 +380,7 @@ async def complete_paid_order(
     user_id = int(order["user_id"])
     product_id = str(order["product_id"])
     product_name = str(order["product_name"])
+    quantity = int(order.get("quantity", 1))
 
     try:
         await db.mark_order_processing(
@@ -188,7 +389,7 @@ async def complete_paid_order(
 
         result = await shop.purchase(
             product_id=product_id,
-            quantity=int(order.get("quantity", 1)),
+            quantity=quantity,
             external_order_id=external_order_id,
         )
 
@@ -212,7 +413,7 @@ async def complete_paid_order(
             user_id,
             "✅ <b>تم تأكيد الدفع وتنفيذ طلبك</b>\n\n"
             f"🛍 المنتج: {product_name}\n"
-            f"🧾 رقم الطلب: "
+            "🧾 رقم الطلب: "
             f"<code>{provider_order_id}</code>\n\n"
             "🔐 بيانات الاشتراك:\n"
             f"<code>{credentials}</code>",
@@ -220,7 +421,8 @@ async def complete_paid_order(
 
     except ShopDigitalError as exc:
         error_message = (
-            f"تم استلام الدفع لكن فشل طلب المزود: {exc}"
+            "تم استلام الدفع لكن فشل طلب المزود: "
+            f"{exc}"
         )
 
         await db.mark_order_failed(
@@ -233,7 +435,7 @@ async def complete_paid_order(
             "⚠️ تم تأكيد دفعتك، لكن تعذر تنفيذ "
             "المنتج تلقائيًا.\n"
             "تم إرسال الطلب إلى الإدارة للمراجعة.\n\n"
-            f"🧾 رقم الطلب:\n"
+            "🧾 رقم الطلب:\n"
             f"<code>{external_order_id}</code>",
         )
 
@@ -242,7 +444,7 @@ async def complete_paid_order(
                 settings.admin_id,
                 "⚠️ <b>دفعة مؤكدة وطلب فاشل</b>\n\n"
                 f"المستخدم: <code>{user_id}</code>\n"
-                f"الطلب: "
+                "الطلب: "
                 f"<code>{external_order_id}</code>\n"
                 f"المنتج: {product_name}\n"
                 f"الخطأ: {exc}",
@@ -264,7 +466,7 @@ async def complete_paid_order(
             "⚠️ تم تأكيد دفعتك، لكن حدث خطأ أثناء "
             "تجهيز المنتج.\n"
             "ستقوم الإدارة بمراجعة الطلب.\n\n"
-            f"🧾 رقم الطلب:\n"
+            "🧾 رقم الطلب:\n"
             f"<code>{external_order_id}</code>",
         )
 
@@ -273,7 +475,7 @@ async def complete_paid_order(
                 settings.admin_id,
                 "🚨 <b>خطأ بعد تأكيد دفعة</b>\n\n"
                 f"المستخدم: <code>{user_id}</code>\n"
-                f"الطلب: "
+                "الطلب: "
                 f"<code>{external_order_id}</code>\n"
                 f"الخطأ: <code>{exc}</code>",
             )
@@ -282,7 +484,10 @@ async def complete_paid_order(
 async def process_transfer_log(
     *,
     log: dict[str, Any],
-    waiting_by_amount: dict[Decimal, dict[str, Any]],
+    waiting_by_amount: dict[
+        Decimal,
+        dict[str, Any],
+    ],
     session: aiohttp.ClientSession,
     bot: Bot,
     db: Database,
@@ -299,18 +504,29 @@ async def process_transfer_log(
     if not data or not tx_hash or not block_hex:
         return
 
-    raw_amount = int(data, 16)
+    try:
+        raw_amount = int(data, 16)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid USDT transfer data: %s",
+            data,
+        )
+        return
+
     transfer_amount = (
         Decimal(raw_amount)
         / Decimal(10**USDT_DECIMALS)
     )
 
-    payment = waiting_by_amount.get(transfer_amount)
+    payment = waiting_by_amount.get(
+        transfer_amount
+    )
 
     if not payment:
         return
 
     block_number = int(block_hex, 16)
+
     transfer_time = await get_block_timestamp(
         session,
         settings.bsc_rpc_url,
@@ -320,15 +536,28 @@ async def process_transfer_log(
     created_at = parse_sqlite_datetime(
         payment["created_at"]
     )
+
     expires_at = parse_sqlite_datetime(
         payment["expires_at"]
     )
 
-    # يمنع قبول تحويل قديم له نفس المبلغ.
+    # منع قبول تحويل قديم يحمل نفس المبلغ.
     if transfer_time < created_at:
+        logger.info(
+            "Ignoring old transfer: tx=%s amount=%s",
+            tx_hash,
+            transfer_amount,
+        )
         return
 
+    # منع قبول تحويل حصل بعد انتهاء الطلب.
     if transfer_time > expires_at:
+        logger.info(
+            "Ignoring expired transfer: "
+            "tx=%s amount=%s",
+            tx_hash,
+            transfer_amount,
+        )
         return
 
     external_order_id = str(
@@ -344,7 +573,8 @@ async def process_transfer_log(
         return
 
     logger.info(
-        "USDT payment confirmed: order=%s tx=%s amount=%s",
+        "USDT payment confirmed: "
+        "order=%s tx=%s amount=%s",
         external_order_id,
         tx_hash,
         transfer_amount,
@@ -372,66 +602,88 @@ async def monitor_payments(
     shop: ShopDigitalClient,
     settings: Settings,
 ) -> None:
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(
+        total=45,
+        connect=15,
+        sock_read=30,
+    )
 
     async with aiohttp.ClientSession(
         timeout=timeout
     ) as session:
-        latest = await get_latest_block(
-            session,
-            settings.bsc_rpc_url,
-        )
-
-        last_scanned_block = max(
-            0,
-            latest
-            - REQUIRED_CONFIRMATIONS
-            - INITIAL_LOOKBACK_BLOCKS,
-        )
-
-        logger.info(
-            "USDT payment monitor started at block %s",
-            last_scanned_block,
-        )
+        last_scanned_block: int | None = None
 
         while True:
             try:
-                await db.expire_old_payments()
-
-                waiting = await db.get_waiting_payments(
-                    limit=500
-                )
-
                 latest = await get_latest_block(
                     session,
                     settings.bsc_rpc_url,
                 )
 
-                confirmed_block = (
-                    latest - REQUIRED_CONFIRMATIONS
+                confirmed_block = max(
+                    0,
+                    latest - REQUIRED_CONFIRMATIONS,
                 )
 
-                if confirmed_block <= last_scanned_block:
+                # تهيئة المراقب لأول مرة أو بعد إعادة التشغيل.
+                if last_scanned_block is None:
+                    last_scanned_block = max(
+                        0,
+                        confirmed_block
+                        - INITIAL_LOOKBACK_BLOCKS,
+                    )
+
+                    logger.info(
+                        "USDT payment monitor started "
+                        "at block %s; latest confirmed=%s",
+                        last_scanned_block,
+                        confirmed_block,
+                    )
+
+                await db.expire_old_payments()
+
+                waiting = (
+                    await db.get_waiting_payments(
+                        limit=500
+                    )
+                )
+
+                if (
+                    confirmed_block
+                    <= last_scanned_block
+                ):
                     await asyncio.sleep(
                         POLL_INTERVAL_SECONDS
                     )
                     continue
 
+                # لا داعي لاستدعاء eth_getLogs
+                # عندما لا توجد دفعات معلقة.
                 if not waiting:
-                    last_scanned_block = confirmed_block
+                    last_scanned_block = (
+                        confirmed_block
+                    )
+
                     await asyncio.sleep(
                         POLL_INTERVAL_SECONDS
                     )
                     continue
 
                 waiting_by_amount = {
-                    Decimal(str(item["payment_amount"])): item
+                    Decimal(
+                        str(item["payment_amount"])
+                    ): item
                     for item in waiting
                 }
 
-                start_block = last_scanned_block + 1
+                start_block = (
+                    last_scanned_block + 1
+                )
 
-                while start_block <= confirmed_block:
+                while (
+                    start_block
+                    <= confirmed_block
+                ):
                     end_block = min(
                         start_block
                         + BLOCKS_PER_REQUEST
@@ -447,6 +699,14 @@ async def monitor_payments(
                         end_block,
                     )
 
+                    logger.debug(
+                        "Scanned USDT logs: "
+                        "blocks=%s-%s logs=%s",
+                        start_block,
+                        end_block,
+                        len(logs),
+                    )
+
                     for event_log in logs:
                         await process_transfer_log(
                             log=event_log,
@@ -460,6 +720,8 @@ async def monitor_payments(
                             settings=settings,
                         )
 
+                    # لا يتم تحديث المؤشر إلا بعد نجاح
+                    # قراءة النطاق بالكامل.
                     last_scanned_block = end_block
                     start_block = end_block + 1
 
@@ -473,8 +735,28 @@ async def monitor_payments(
                 )
                 raise
 
+            except RpcHttpError as exc:
+                logger.error(
+                    "RPC HTTP error: "
+                    "method=%s status=%s body=%s",
+                    exc.method,
+                    exc.status,
+                    exc.message,
+                )
+
+                await asyncio.sleep(30)
+
+            except RpcError as exc:
+                logger.error(
+                    "USDT RPC error: %s",
+                    exc,
+                )
+
+                await asyncio.sleep(30)
+
             except Exception:
                 logger.exception(
                     "USDT payment monitor error"
                 )
-                await asyncio.sleep(15)
+
+                await asyncio.sleep(30)
