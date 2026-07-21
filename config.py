@@ -16,6 +16,7 @@ class Settings:
     database_path: str
     shopdigital_base_url: str
     usdt_wallet: str
+    bsc_rpc_url: str
 
 
 def load_settings() -> Settings:
@@ -31,13 +32,16 @@ def load_settings() -> Settings:
     ).strip().rstrip("/")
 
     usdt_wallet = os.getenv("USDT_WALLET", "").strip()
+    bsc_rpc_url = os.getenv("BSC_RPC_URL", "").strip()
 
     if not bot_token:
-        raise RuntimeError("BOT_TOKEN غير موجود في ملف .env")
+        raise RuntimeError(
+            "BOT_TOKEN غير موجود في متغيرات البيئة"
+        )
 
     if not api_key:
         raise RuntimeError(
-            "SHOPDIGITAL_API_KEY غير موجود في ملف .env"
+            "SHOPDIGITAL_API_KEY غير موجود في متغيرات البيئة"
         )
 
     try:
@@ -59,14 +63,22 @@ def load_settings() -> Settings:
             "PROFIT_MARGIN لا يمكن أن يكون سالبًا"
         )
 
-    if not usdt_wallet:
-        raise RuntimeError(
-            "USDT_WALLET غير موجود في ملف .env"
-        )
-
-    if not usdt_wallet.startswith("0x") or len(usdt_wallet) != 42:
+    if (
+        not usdt_wallet.startswith("0x")
+        or len(usdt_wallet) != 42
+    ):
         raise RuntimeError(
             "USDT_WALLET ليس عنوان BEP20 صالحًا"
+        )
+
+    if not bsc_rpc_url:
+        raise RuntimeError(
+            "BSC_RPC_URL غير موجود في متغيرات البيئة"
+        )
+
+    if not bsc_rpc_url.startswith(("https://", "http://")):
+        raise RuntimeError(
+            "BSC_RPC_URL يجب أن يكون رابط HTTPS أو HTTP"
         )
 
     return Settings(
@@ -77,4 +89,5 @@ def load_settings() -> Settings:
         database_path=database_path,
         shopdigital_base_url=base_url,
         usdt_wallet=usdt_wallet,
+        bsc_rpc_url=bsc_rpc_url,
     )
